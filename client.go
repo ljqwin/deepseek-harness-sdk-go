@@ -36,6 +36,7 @@ type HarnessClientOptions struct {
 	InitializeTimeoutSeconds float64
 	RequestTimeoutSeconds    float64
 	ShutdownTimeoutSeconds   float64
+	ProcessController        ProcessController
 
 	// Command and Args are a complete explicit command channel. DSHBin is the
 	// dsh CLI channel and receives the SDK profile and patch arguments.
@@ -52,6 +53,25 @@ type HarnessClientOptions struct {
 	RuntimeVersion  string
 	RuntimeCacheDir string
 }
+
+// ProcessController lets an embedding application place the runtime in an
+// OS-specific containment boundary. Start must start cmd before returning.
+// Terminate and Release must be idempotent. A nil controller preserves the
+// SDK's built-in single-process behavior.
+type ProcessController interface {
+	Start(cmd *exec.Cmd) error
+	Terminate(cmd *exec.Cmd) error
+	Release(cmd *exec.Cmd) error
+}
+
+type defaultProcessController struct{}
+
+func (defaultProcessController) Start(cmd *exec.Cmd) error { return cmd.Start() }
+func (defaultProcessController) Terminate(cmd *exec.Cmd) error {
+	terminateProcess(cmd)
+	return nil
+}
+func (defaultProcessController) Release(*exec.Cmd) error { return nil }
 
 // HarnessConfig is the Python SDK-compatible name for HarnessClientOptions.
 type HarnessConfig = HarnessClientOptions
@@ -143,6 +163,9 @@ func NewHarnessClient(config ...HarnessClientOptions) *HarnessClient {
 	if options.ShutdownTimeoutSeconds == 0 {
 		options.ShutdownTimeoutSeconds = 1
 	}
+	if options.ProcessController == nil {
+		options.ProcessController = defaultProcessController{}
+	}
 	options.Patches = cloneStrings(options.Patches)
 	options.Args = append([]string(nil), options.Args...)
 	options.LaunchArgsOverride = cloneStrings(options.LaunchArgsOverride)
@@ -192,7 +215,7 @@ func (c *HarnessClient) Start() error {
 		_ = stdout.Close()
 		return &IOError{Err: err}
 	}
-	if err := command.Start(); err != nil {
+	if err := c.Options.ProcessController.Start(command); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
 		_ = stderr.Close()
@@ -203,8 +226,9 @@ func (c *HarnessClient) Start() error {
 	c.mu.Lock()
 	if c.state != nil && !c.state.isClosed() {
 		c.mu.Unlock()
-		_ = command.Process.Kill()
+		_ = c.Options.ProcessController.Terminate(command)
 		_ = command.Wait()
+		_ = c.Options.ProcessController.Release(command)
 		return nil
 	}
 	c.state = state
@@ -238,9 +262,9 @@ func (c *HarnessClient) Close() error {
 	_ = state.stdin.Close()
 
 	if !waitFor(state.processDone, c.shutdownTimeout()) {
-		terminateProcess(state.cmd)
+		_ = c.Options.ProcessController.Terminate(state.cmd)
 		if !waitFor(state.processDone, c.shutdownTimeout()) {
-			_ = state.cmd.Process.Kill()
+			_ = c.Options.ProcessController.Terminate(state.cmd)
 			<-state.processDone
 		}
 	}
@@ -657,6 +681,7 @@ func (c *HarnessClient) stderrLoop(state *clientState, stderr io.ReadCloser) {
 
 func (c *HarnessClient) processLoop(state *clientState) {
 	err := state.cmd.Wait()
+	_ = c.Options.ProcessController.Release(state.cmd)
 	var exitCode *int
 	if err == nil {
 		code := 0

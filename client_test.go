@@ -5,11 +5,36 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+type trackingProcessController struct {
+	started    int
+	terminated int
+	released   int
+}
+
+func (c *trackingProcessController) Start(cmd *exec.Cmd) error {
+	c.started++
+	return cmd.Start()
+}
+
+func (c *trackingProcessController) Terminate(cmd *exec.Cmd) error {
+	c.terminated++
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	return cmd.Process.Kill()
+}
+
+func (c *trackingProcessController) Release(*exec.Cmd) error {
+	c.released++
+	return nil
+}
 
 // TestFakeRuntimeProcess is launched as a child process by the mechanism
 // tests below. Keeping it in the test binary exercises the same pipe behavior
@@ -54,6 +79,26 @@ func TestFakeRuntimeProcess(t *testing.T) {
 		default:
 			handleFakeRequest(t, scenario, message)
 		}
+	}
+}
+
+func TestProcessControllerOwnsRuntimeLifecycle(t *testing.T) {
+	controller := &trackingProcessController{}
+	options := fakeOptions("no-shutdown")
+	options.ProcessController = controller
+	options.ShutdownTimeoutSeconds = 0.02
+	client := NewHarnessClient(options)
+	if err := client.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := client.Initialize(InitializeParams{}); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if controller.started != 1 || controller.terminated == 0 || controller.released != 1 {
+		t.Fatalf("unexpected process lifecycle: start=%d terminate=%d release=%d", controller.started, controller.terminated, controller.released)
 	}
 }
 
@@ -171,7 +216,8 @@ func handleFakeRequest(t *testing.T, scenario string, message map[string]any) {
 		})
 	case "shutdown":
 		if scenario == "no-shutdown" {
-			select {}
+			time.Sleep(5 * time.Second)
+			return
 		}
 		writeFakeFrame(t, map[string]any{"jsonrpc": "2.0", "id": message["id"], "result": map[string]any{}})
 		os.Exit(0)
